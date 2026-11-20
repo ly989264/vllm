@@ -260,6 +260,23 @@ def _pd_startup_log_runner(worker: Any) -> None:
         pass
 
 
+def _pd_startup_runner_stages(timing: Any) -> tuple[str, str] | None:
+    """vllm-ascend's DeviceTiming.runner_stages (the stages it times, in order) and
+    stages_source ("default" or "env"). vllm-ascend leaves runner_stages empty when this
+    instance is not D; on D it lists at least forward and sampling, also with the four
+    runner stages off. None when empty or not readable: the line then stays as in T51."""
+    try:
+        stages = getattr(timing, "runner_stages", None)
+        if not isinstance(stages, (tuple, list)) or not stages:
+            return None
+        source = getattr(timing, "stages_source", None)
+        return ",".join(str(stage) for stage in stages), (
+            source if source in ("default", "env") else "?"
+        )
+    except Exception:
+        return None
+
+
 def _pd_startup_log_timing(worker: Any, context: Any, scheduler_output: Any) -> None:
     """Plain log line, not a [PD_DIAG] record, after the first execute_model of a real request
     returned: whether vllm-ascend's device timing is on ("?" if not readable). vllm-ascend
@@ -275,11 +292,16 @@ def _pd_startup_log_timing(worker: Any, context: Any, scheduler_output: Any) -> 
         _PD_STARTUP_TIMING_LOGGED = True
         enabled = getattr(timing, "enabled", None)
         tp_rank = context.get("tp_rank") if isinstance(context, dict) else None
-        logger.info(
-            "PD_DIAG_STARTUP worker device_timing=%s tp_rank=%s",
+        line = "PD_DIAG_STARTUP worker device_timing=%s tp_rank=%s"
+        args: list[Any] = [
             "on" if enabled is True else "off" if enabled is False else "?",
             tp_rank if isinstance(tp_rank, int) else "?",
-        )
+        ]
+        stages = _pd_startup_runner_stages(timing)
+        if stages is not None:
+            line += " runner_stages=%s source=%s"
+            args += stages
+        logger.info(line, *args)
     except Exception:
         pass
 

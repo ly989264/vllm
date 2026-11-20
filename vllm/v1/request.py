@@ -242,6 +242,8 @@ class Request:
         self.pd_executions = 0
         self.pd_decode_steps = 0
         self.pd_execution_id: str | None = None
+        # D only (the scheduler calls pd_kv_ready_transition when is_pd_decode).
+        self.pd_kv_ready: dict[str, Any] | None = None
 
         self.block_hashes: list[BlockHash] = []
         # Store the block hasher without binding self to avoid creating a
@@ -399,6 +401,113 @@ class Request:
         assert input_id < len(self.mm_features)
         return self.mm_features[input_id].mm_position.get_num_embeds()
 
+    def pd_kv_ready_transition(
+        self,
+        event: str,
+        *,
+        now_ns: int | None = None,
+        execution_id: str | None = None,
+        load_failed: bool = False,
+        waiting_for_kv: bool = False,
+    ) -> None:
+        """Rounds from the scheduler seeing this request's KV ready to the
+        schedule() call that runs it (D only; the scheduler gates every call).
+
+        ready      KV ready seen while WAITING_FOR_REMOTE_KVS: close a round
+                   still open as missing, open a new one.
+        promoted   back to WAITING/PREEMPTED: promoted_ns of the open round.
+        scheduled  run by a schedule() call: end at that call's start_ns.
+        load_failed  the pending load failed (before or after ready).
+        error / cancelled / missing  finished by finish_requests: close the
+                   open round with this status; without one, a request still
+                   WAITING_FOR_REMOTE_KVS gets a round with no start.
+        The terminal record closes a round still open as missing (cancelled on
+        shutdown) and writes stages.kv_ready_wait when there was a round.
+        """
+        if self.pd_terminal_emitted:
+            return
+        state = self.pd_kv_ready
+        if state is None:
+            state = self.pd_kv_ready = dict(
+                episode=0, ranges=[], dropped=0, first=None, open=None, failed=False
+            )
+        current = state["open"]
+        if event == "load_failed":
+            if current is not None:
+                current["load_failed"] = True
+            else:
+                state["failed"] = True
+            return
+        if event == "promoted":
+            if current is not None:
+                if current["promoted_ns"] is None:
+                    current["promoted_ns"] = time.monotonic_ns()
+                current["load_failed"] = current["load_failed"] or load_failed
+            return
+        if event == "scheduled":
+            if current is not None:
+                self._pd_kv_ready_close(current, now_ns, "ok", execution_id)
+                state["open"] = None
+            return
+        if event in ("error", "cancelled", "missing"):
+            if current is not None:
+                self._pd_kv_ready_close(current, None, event, None)
+                state["open"] = None
+            elif waiting_for_kv:
+                self._pd_kv_ready_open(state, None, load_failed)
+                self._pd_kv_ready_close(state["open"], None, event, None)
+                state["open"] = None
+            return
+        if event != "ready":
+            return
+        if current is not None:
+            self._pd_kv_ready_close(current, None, "missing", None)
+        self._pd_kv_ready_open(state, time.monotonic_ns(), load_failed)
+
+    def _pd_kv_ready_open(
+        self, state: dict[str, Any], start_ns: int | None, load_failed: bool
+    ) -> None:
+        state["episode"] += 1
+        current = dict(
+            episode=state["episode"],
+            start_ns=start_ns,
+            promoted_ns=None,
+            end_ns=None,
+            duration_ns=None,
+            ready_execution_id=(
+                diag.current().get("execution_id") if start_ns is not None else None
+            ),
+            scheduled_execution_id=None,
+            status=None,
+            load_failed=bool(load_failed or state["failed"]),
+        )
+        state["failed"] = False
+        state["open"] = current
+        if state["first"] is None:
+            state["first"] = current
+        if len(state["ranges"]) < 64:
+            state["ranges"].append(current)
+        else:
+            state["dropped"] += 1
+
+    @staticmethod
+    def _pd_kv_ready_close(
+        current: dict[str, Any],
+        end_ns: int | None,
+        status: str,
+        execution_id: str | None,
+    ) -> None:
+        start_ns = current["start_ns"]
+        current["end_ns"] = end_ns
+        current["scheduled_execution_id"] = execution_id
+        if start_ns is not None and end_ns is not None:
+            duration = end_ns - start_ns
+            valid = duration >= 0
+            current["duration_ns"] = duration if valid else None
+            current["status"] = status if valid else "invalid"
+        else:
+            current["status"] = status
+
     def pd_queue_transition(
         self,
         transition: str,
@@ -526,6 +635,35 @@ class Request:
             complete=not self.pd_hash_ranges_dropped,
             timing_scope="associated_request_block_hasher_calls",
         )
+        kv_ready = self.pd_kv_ready
+        if kv_ready is not None and kv_ready["episode"]:
+            if kv_ready["open"] is not None:
+                self._pd_kv_ready_close(
+                    kv_ready["open"],
+                    None,
+                    "cancelled" if completion == "shutdown" else "missing",
+                    None,
+                )
+                kv_ready["open"] = None
+            first = kv_ready["first"]
+            summary.add_stage(
+                "kv_ready_wait",
+                calls=kv_ready["episode"],
+                duration_ns=first["duration_ns"],
+                start_ns=first["start_ns"],
+                end_ns=first["end_ns"],
+                status=first["status"],
+                ranges=kv_ready["ranges"],
+                dropped_ranges=kv_ready["dropped"],
+                complete=first["start_ns"] is not None and first["end_ns"] is not None,
+                end_observed=first["end_ns"] is not None,
+                timing_scope="kv_ready_seen_to_scheduled",
+            )
+            # add_stage reports a call without a duration as missing; error and
+            # cancelled rounds have no end, so keep the first round's own status.
+            stage = summary.stages.get("kv_ready_wait")
+            if stage is not None:
+                stage["status"] = first["status"]
         terminal = self.is_finished()
         summary.finish(
             status=(

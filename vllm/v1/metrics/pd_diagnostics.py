@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import socket
+import sys
 import threading
 import time
 import uuid
@@ -54,6 +55,10 @@ _SPANS = {
     "kv.save_wait": "wait_for_save",
     "wait_for_save": "wait_for_save",
     "wait_for_transfer": "wait_for_transfer",
+    "runner.prepare_inputs": "prepare_inputs",
+    "runner.lm_head": "lm_head",
+    "runner.draft": "draft",
+    "runner.bookkeeping": "bookkeeping",
 }
 _INTERNAL_SPANS = {"scheduler_external_lookup"}
 _LINK_FIELDS = {
@@ -93,6 +98,25 @@ _LINK_EVENTS = {
     "engine_execution",
     "scheduler_execution",
 }
+
+
+def is_pd_decode(vllm_config: Any) -> bool:
+    """Whether this instance is a PD decode instance (D), for the D-only records.
+
+    It judges the configuration: vllm-ascend's own condition
+    is_pd_decode_recompute_scheduler_enabled(vllm_config) (top-level KV role
+    kv_consumer and not kv_producer, recompute scheduler enabled), the
+    condition under which vllm-ascend selects its recompute scheduler. Read
+    from vllm_ascend.utils only when that module is already loaded; never
+    imports vllm_ascend. Not loaded, or any error: False (not D).
+    Call once at initialization and keep the result, never per step.
+    """
+    try:
+        utils = sys.modules.get("vllm_ascend.utils")
+        check = getattr(utils, "is_pd_decode_recompute_scheduler_enabled", None)
+        return bool(check(vllm_config)) if callable(check) else False
+    except Exception:
+        return False
 
 
 def new_id(kind: str) -> str:

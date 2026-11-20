@@ -78,6 +78,10 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    # Set in __init__; the class values cover schedulers built without it.
+    _pd_decode = False
+    _pd_kv_ready_open: "list[Request] | tuple[()]" = ()
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -412,6 +416,11 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
+        # D only: kv_ready_wait rounds (stages.kv_ready_wait of core_summary[request]).
+        # Decided once, after the KV connector and vllm-ascend's config are set up.
+        self._pd_decode = diag.is_pd_decode(vllm_config)
+        self._pd_kv_ready_open = []
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -592,6 +601,8 @@ class Scheduler(SchedulerInterface):
         with diag.scope(**identity), diag.collect(summary):
             try:
                 output = self._schedule(throttle_prefills)
+                if self._pd_kv_ready_open:
+                    self._pd_kv_ready_scheduled(output, start_ns, execution_id)
                 summary.update(
                     request_ids=list(output.num_scheduled_tokens),
                     num_scheduled_tokens=dict(output.num_scheduled_tokens),
@@ -2061,6 +2072,8 @@ class Scheduler(SchedulerInterface):
                     num_scheduled_tokens,
                 )
             )
+        if failed_kv_load_req_ids and self._pd_decode:
+            self._pd_kv_load_failed(failed_kv_load_req_ids)
 
         # Persist per-step routed experts into the scheduler-side slot
         # buffer (CPU->CPU fancy-index assign; ~few MB per step).
@@ -2700,6 +2713,8 @@ class Scheduler(SchedulerInterface):
 
         # Second pass: set status and free requests
         for request in valid_requests:
+            if self._pd_decode:
+                self._pd_kv_ready_finish(request, finished_status)
             delay_free_blocks = False
             if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 delay_free_blocks = (
@@ -2973,6 +2988,8 @@ class Scheduler(SchedulerInterface):
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
         for request in self.requests.values():
+            if self._pd_decode:
+                self._pd_kv_ready_finish(request, RequestStatus.FINISHED_ABORTED)
             request.pd_queue_transition("finished", completion="shutdown")
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
@@ -3127,6 +3144,11 @@ class Scheduler(SchedulerInterface):
             # in KVConnectorOutput.finished_recving
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
+            if self._pd_decode:
+                request.pd_kv_ready_transition(
+                    "promoted",
+                    load_failed=request.request_id in self.failed_recving_kv_req_ids,
+                )
             self._update_waiting_for_remote_kv(request)
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
@@ -3173,6 +3195,8 @@ class Scheduler(SchedulerInterface):
             assert req_id in self.requests
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                if self._pd_decode and req_id not in self.finished_recving_kv_req_ids:
+                    self._pd_kv_ready_seen(req)
                 self.finished_recving_kv_req_ids.add(req_id)
             else:
                 assert RequestStatus.is_finished(req.status)
@@ -3320,6 +3344,61 @@ class Scheduler(SchedulerInterface):
                 affected_req_ids.add(request.request_id)
 
         return affected_req_ids, total_affected_tokens, blocks_to_evict
+
+    def _pd_kv_ready_seen(self, request: Request) -> None:
+        """KV ready seen while WAITING_FOR_REMOTE_KVS opens a kv_ready_wait round."""
+        state = request.pd_kv_ready
+        was_open = state is not None and state["open"] is not None
+        request.pd_kv_ready_transition(
+            "ready", load_failed=request.request_id in self.failed_recving_kv_req_ids
+        )
+        if not was_open:
+            self._pd_kv_ready_open.append(request)
+
+    def _pd_kv_ready_scheduled(
+        self, output: SchedulerOutput, start_ns: int, execution_id: str
+    ) -> None:
+        """Close the rounds of requests this schedule() call runs, at its start."""
+        scheduled = output.num_scheduled_tokens
+        still_open = []
+        for request in self._pd_kv_ready_open:
+            state = request.pd_kv_ready
+            if state is None or state["open"] is None:
+                continue
+            if (
+                request.status == RequestStatus.RUNNING
+                and request.request_id in scheduled
+            ):
+                request.pd_kv_ready_transition(
+                    "scheduled", now_ns=start_ns, execution_id=execution_id
+                )
+            else:
+                still_open.append(request)
+        self._pd_kv_ready_open = still_open
+
+    def _pd_kv_load_failed(self, req_ids: Iterable[str]) -> None:
+        for req_id in req_ids:
+            request = self.requests.get(req_id)
+            if (
+                request is not None
+                and request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            ):
+                request.pd_kv_ready_transition("load_failed")
+
+    def _pd_kv_ready_finish(
+        self, request: Request, finished_status: RequestStatus
+    ) -> None:
+        waiting = request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        if waiting or request.pd_kv_ready is not None:
+            request.pd_kv_ready_transition(
+                "error"
+                if finished_status == RequestStatus.FINISHED_ERROR
+                else "cancelled"
+                if finished_status == RequestStatus.FINISHED_ABORTED
+                else "missing",
+                waiting_for_kv=waiting,
+                load_failed=request.request_id in self.failed_recving_kv_req_ids,
+            )
 
     def _handle_failed_recving(self, failed_req_ids: set[str]) -> set[str]:
         """Fail closed for layouts whose block IDs are not globally unique."""
