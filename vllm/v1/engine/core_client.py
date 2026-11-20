@@ -64,6 +64,7 @@ from vllm.v1.fault_tolerance.utils import (
     FaultToleranceRequest,
     FaultToleranceResult,
 )
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.pool.late_interaction import get_late_interaction_engine_index
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 
@@ -1185,7 +1186,12 @@ class AsyncMPClient(MPClient):
             engine = self.core_engine
 
         message = (request_type.value, *self.encoder.encode(request))
-        return self._send_input_message(message, engine)
+        future = self._send_input_message(message, engine)
+        if request_type == EngineCoreRequestType.ADD:
+            observation = diag.current_add_request_send()
+            if observation is not None:
+                observation.watch(future)
+        return future
 
     def _send_input_message(
         self, message: tuple[bytestr, ...], engine: EngineIdentity

@@ -157,6 +157,12 @@ class EngineCoreRequest(
 
     session_id: str | None = None
 
+    # Explicit frontend observation identity survives process transport/fanout.
+    pd_identity: dict[str, Any] | None = None
+
+    # Frontend timing evidence; only comparable within its saved clock domain.
+    pd_tokenization: dict[str, Any] | None = None
+
     @property
     def params(self) -> SamplingParams | PoolingParams:
         """Return the processed params (sampling or pooling)."""
@@ -233,6 +239,11 @@ class EngineCoreOutput(
     # Appended last so `array_like` positional serialization stays compatible.
     spec_decode_metrics: RequestSpecDecodeMetrics | None = None
 
+    # Diagnostic ownership from the actual completed execution. Keep appended
+    # defaults for array_like compatibility, including pre-execution errors.
+    pd_execution_id: str | None = None
+    output_batch_id: str | None = None
+
     @property
     def finished(self) -> bool:
         return self.finish_reason is not None
@@ -275,6 +286,9 @@ class EngineCoreOutputs(
     # In DP case, used to signal that a request was received for an
     # "old" wave, so the next wave needs to be started in other engines.
     start_wave: int | None = None
+
+    # Optional diagnostic identity shared by all members of this transport batch.
+    output_batch_id: str | None = None
 
     def __post_init__(self):
         if self.timestamp == 0.0:

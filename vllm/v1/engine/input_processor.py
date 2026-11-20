@@ -31,6 +31,7 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds, random_uuid
 from vllm.utils.async_utils import make_async
 from vllm.utils.jsontree import json_iter_leaves
 from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.metrics import pd_diagnostics as diag
 
 logger = init_logger(__name__)
 
@@ -70,9 +71,17 @@ class InputProcessor:
         # Raw-prompt preprocessing (tokenization and multimodal processing)
         # is blocking, so async callers should run it on the renderer's
         # thread pool to keep their event loop responsive.
-        self.process_inputs_async = make_async(
-            self.process_inputs, executor=self.renderer._executor
+        process_in_executor = make_async(
+            self._process_inputs_with_context, executor=self.renderer._executor
         )
+
+        async def process_inputs_async(*args, **kwargs):
+            # Snapshot explicitly before crossing the executor boundary.
+            return await process_in_executor(
+                diag.current(), diag.current_batch(), *args, **kwargs
+            )
+
+        self.process_inputs_async = process_inputs_async
 
     @property
     def tokenizer(self) -> TokenizerLike | None:
@@ -277,6 +286,17 @@ class InputProcessor:
             )
         else:
             request.request_id = f"{request.external_req_id}-{random_uuid():.8}"
+        owner = diag.current_batch()
+        if owner is not None:
+            owner.add_link(
+                "request_id",
+                request_id=request.request_id,
+                external_req_id=request.external_req_id,
+            )
+
+    def _process_inputs_with_context(self, context, owner, *args, **kwargs):
+        with diag.scope(**context), diag.collect(owner):
+            return self.process_inputs(*args, **kwargs)
 
     def process_inputs(
         self,
@@ -419,6 +439,7 @@ class InputProcessor:
                     )
                 )
 
+        owner = diag.current_batch()
         return EngineCoreRequest(
             request_id=request_id,
             prompt_token_ids=prompt_token_ids,
@@ -435,6 +456,21 @@ class InputProcessor:
             trace_headers=trace_headers,
             resumable=resumable,
             session_id=session_id,
+            pd_tokenization=engine_input.get("pd_tokenization"),
+            pd_identity={
+                key: owner.fields[key]
+                for key in (
+                    "observation_id",
+                    "external_req_id",
+                    "api_request_id",
+                    "submission_id",
+                    "parent_request_id",
+                    "prompt_index",
+                    "choice_index",
+                )
+                if owner is not None and owner.fields.get(key) is not None
+            }
+            or None,
         )
 
     def _validate_prompt_len(

@@ -63,6 +63,7 @@ from vllm.renderers.inputs.preprocess import (
 )
 from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
 from vllm.utils.mistral import mt as _mt
+from vllm.v1.metrics import pd_diagnostics as diag
 
 logger = init_logger(__name__)
 
@@ -491,6 +492,19 @@ class OnlineRenderer:
         """Build Harmony (GPT-OSS) messages and engine prompt from a chat request."""
         reuse_ids = _reused_prompt_token_ids(request)
         if reuse_ids:
+            diag.emit(
+                "render",
+                status="skipped",
+                reason="reused_prompt_token_ids",
+                duration_ns=None,
+            )
+            diag.emit(
+                "tokenize",
+                status="skipped",
+                reason="reused_prompt_token_ids",
+                duration_ns=None,
+                num_output_tokens=len(reuse_ids),
+            )
             # Decode-side token reuse: feed the forwarded ids straight to the
             # engine. Harmony has no adjust_request hook to preserve.
             engine_input = tokens_input(reuse_ids, cache_salt=request.cache_salt)
@@ -530,8 +544,28 @@ class OnlineRenderer:
         messages.extend(parse_chat_inputs_to_harmony_messages(chat_messages))
 
         # Render prompt token ids.
-        prompt_token_ids = render_for_completion(messages)
+        with diag.span(
+            "render",
+            source="harmony_render_for_completion",
+            includes_tokenization=True,
+        ) as timing:
+            prompt_token_ids = render_for_completion(messages)
+            timing["num_output_tokens"] = len(prompt_token_ids)
+        diag.emit(
+            "tokenize",
+            status="fused",
+            reason="harmony_render_for_completion",
+            duration_ns=None,
+        )
         engine_input = tokens_input(prompt_token_ids, cache_salt=request.cache_salt)
+        engine_input["pd_tokenization"] = {
+            **diag.clock_domain(),
+            "boundary_id": diag.new_id("fused_render_end"),
+            "end_ns": timing["end_ns"],
+            "status": "fused",
+            "reason": "harmony_render_for_completion",
+            "source": "fused_render_return",
+        }
 
         return messages, [engine_input]
 
@@ -683,6 +717,19 @@ class OnlineRenderer:
 
         reuse_ids = _reused_prompt_token_ids(request)
         if reuse_ids:
+            diag.emit(
+                "render",
+                status="skipped",
+                reason="reused_prompt_token_ids",
+                duration_ns=None,
+            )
+            diag.emit(
+                "tokenize",
+                status="skipped",
+                reason="reused_prompt_token_ids",
+                duration_ns=None,
+                num_output_tokens=len(reuse_ids),
+            )
             # Decode-side token reuse: feed the forwarded ids straight to the
             # engine, skipping templating and tokenization. ``messages`` are not
             # tokenized, so conversation is empty. The adjust_request tail below
