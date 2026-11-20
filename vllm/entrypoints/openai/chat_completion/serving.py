@@ -1114,7 +1114,7 @@ class OpenAIServingChat(GenerateBaseServing):
 
             choices.append(choice_data)
             # v0.30.0 iterates without enumerate(); one append per output, so
-            # this is the same position that patch 01 records as ``i``.
+            # this is the position an enumerate() over the outputs would give.
             choice_position = len(choices) - 1
             pd_api.generated_chat(
                 request_id,

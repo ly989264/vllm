@@ -41,7 +41,7 @@ logger = init_logger(__name__)
 _R = TypeVar("_R")
 
 
-# ---- T51 C14 (A2): a runner may take over writing this phase's worker_summary ------------------------------------
+# ---- A runner may take over writing this phase's worker_summary ----------------------
 _PD_CLAIMS_LOCK = threading.Lock()
 _PD_CLAIMS: dict[int, "PdFinishClaim"] = {}
 _PD_HELD: dict[int, "PdFinishClaim"] = {}
@@ -264,7 +264,7 @@ def _pd_startup_runner_stages(timing: Any) -> tuple[str, str] | None:
     """vllm-ascend's DeviceTiming.runner_stages (the stages it times, in order) and
     stages_source ("default" or "env"). vllm-ascend leaves runner_stages empty when this
     instance is not D; on D it lists at least forward and sampling, also with the four
-    runner stages off. None when empty or not readable: the line then stays as in T51."""
+    runner stages off. None when empty or not readable: the line then stays unchanged."""
     try:
         stages = getattr(timing, "runner_stages", None)
         if not isinstance(stages, (tuple, list)) or not stages:
