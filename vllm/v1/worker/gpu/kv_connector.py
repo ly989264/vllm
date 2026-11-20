@@ -89,9 +89,7 @@ class ActiveKVConnector(KVConnector):
         # TODO: sort out KV Connectors' use of forward_context
         with (
             diag.scope(**self._pd_context),
-            diag.span(
-                "kv.load_submit", completion="submission_return_not_transfer_completion"
-            ),
+            diag.kv_load_submit_span(self.vllm_config),
         ):
             if is_forward_context_available():
                 self.kv_connector.start_load_kv(get_forward_context(), **load_kwargs)

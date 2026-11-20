@@ -215,6 +215,7 @@ class EngineCore:
             hash_block_size=hash_block_size,
         )
         _pd_startup_log_scheduler(self.scheduler)
+        diag.log_diag_level(logger, "engine_core")
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion

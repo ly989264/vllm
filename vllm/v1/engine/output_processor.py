@@ -944,6 +944,7 @@ class OutputProcessor:
             status=status,
             complete=status not in ("error", "abort", "cancelled"),
             completion="request_state_terminal",
+            **diag.diag_level_fields(),
         )
 
     def _finish_request(self, req_state: RequestState) -> None:

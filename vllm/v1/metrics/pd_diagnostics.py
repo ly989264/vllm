@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, NamedTuple
 
 _LOG = logging.getLogger(__name__)
 _CONTEXT: contextvars.ContextVar[dict[str, Any] | None] = contextvars.ContextVar(
@@ -117,6 +117,91 @@ def is_pd_decode(vllm_config: Any) -> bool:
         return bool(check(vllm_config)) if callable(check) else False
     except Exception:
         return False
+
+
+class DiagLevel(NamedTuple):
+    level: int
+    source: str
+
+
+_DIAG_LEVEL: DiagLevel | None = None
+_DIAG_LEVEL_LOGGED: set[str] = set()
+_RECORDS_KV_LOAD_SUBMIT: bool | None = None
+
+
+def parse_diag_level(raw: str | None) -> DiagLevel:
+    """PD_DIAG_LEVEL to (level, source). Unset or empty: 3, "default". Exactly
+    "1", "2" or "3": that level, "env". Anything else ("0", "4", "abc", " 2 ",
+    "2x"): 3, "invalid"."""
+    if raw is None or raw == "":
+        return DiagLevel(3, "default")
+    if raw in ("1", "2", "3"):
+        return DiagLevel(int(raw), "env")
+    return DiagLevel(3, "invalid")
+
+
+def diag_level() -> DiagLevel:
+    """The diagnostics level in effect in this process, from PD_DIAG_LEVEL.
+
+    3 (the default) records everything; 2 leaves out the level-3 segments and 1
+    keeps only the level-1 segments (the scheduler's sub-stages are recorded at
+    every level). A component's own switches may record less than the level
+    allows, never more. Read on first use and kept for the life of the process:
+    a change needs a restart.
+    """
+    global _DIAG_LEVEL
+    value = _DIAG_LEVEL
+    if value is None:
+        value = _DIAG_LEVEL = parse_diag_level(os.environ.get("PD_DIAG_LEVEL"))
+    return value
+
+
+def diag_level_fields() -> dict[str, int]:
+    """The diag_level field for the per-request summaries: written only below
+    level 3, so records at the default level are unchanged."""
+    level = diag_level().level
+    return {"diag_level": level} if level < 3 else {}
+
+
+def log_diag_level(log: logging.Logger, role: str) -> None:
+    """Plain startup log line, not a [PD_DIAG] record: the level in effect. Once
+    per process for each role (EngineCore, Worker); never raises."""
+    try:
+        if role in _DIAG_LEVEL_LOGGED:
+            return
+        _DIAG_LEVEL_LOGGED.add(role)
+        level, source = diag_level()
+        log.info("PD_DIAG_STARTUP diag level=%d source=%s", level, source)
+    except Exception:
+        pass
+
+
+def decide_kv_load_submit(vllm_config: Any) -> bool:
+    """Decide, for this process, whether the "kv.load_submit" span
+    (worker_summary stages.submit) is recorded: not on a PD decode instance
+    (is_pd_decode) at level 1, yes everywhere else; any error keeps it. The
+    worker calls this once, after init_device."""
+    global _RECORDS_KV_LOAD_SUBMIT
+    try:
+        records = not (diag_level().level == 1 and is_pd_decode(vllm_config))
+    except Exception:
+        records = True
+    _RECORDS_KV_LOAD_SUBMIT = records
+    return records
+
+
+def kv_load_submit_span(vllm_config: Any = None) -> contextlib.AbstractContextManager:
+    """The "kv.load_submit" span around a KV load submission, or a no-op where
+    decide_kv_load_submit() left it out. If the process has not decided yet, it
+    decides now from vllm_config."""
+    records = _RECORDS_KV_LOAD_SUBMIT
+    if records is None:
+        records = decide_kv_load_submit(vllm_config)
+    if not records:
+        return contextlib.nullcontext()
+    return span(
+        "kv.load_submit", completion="submission_return_not_transfer_completion"
+    )
 
 
 def new_id(kind: str) -> str:

@@ -624,6 +624,8 @@ class WorkerWrapperBase:
             # To make vLLM config available during device initialization
             self.worker.init_device()  # type: ignore
         _pd_startup_log_runner(self.worker)
+        diag.log_diag_level(logger, "worker")
+        diag.decide_kv_load_submit(self.vllm_config)
 
     def __getattr__(self, attr: str):
         return getattr(self.worker, attr)

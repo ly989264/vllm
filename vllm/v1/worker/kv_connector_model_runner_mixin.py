@@ -94,18 +94,14 @@ class KVConnectorModelRunnerMixin:
         # their host-side submission cost off the critical path.
         start_after_forward = not scheduler_output.has_sync_kv_loads
         if not start_after_forward:
-            with diag.span(
-                "kv.load_submit",
-                completion="submission_return_not_transfer_completion",
-            ):
+            with diag.kv_load_submit_span(getattr(kv_connector, "_vllm_config", None)):
                 kv_connector.start_load_kv(get_forward_context())
         try:
             yield output
         finally:
             if start_after_forward:
-                with diag.span(
-                    "kv.load_submit",
-                    completion="submission_return_not_transfer_completion",
+                with diag.kv_load_submit_span(
+                    getattr(kv_connector, "_vllm_config", None)
                 ):
                     kv_connector.start_load_kv(get_forward_context())
             if wait_for_save and not defer_finalize:

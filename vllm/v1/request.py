@@ -684,6 +684,7 @@ class Request:
                 and not self.pd_hash_ranges_dropped
             ),
             completion=completion or self.status.name,
+            **diag.diag_level_fields(),
         )
 
     def record_event(
