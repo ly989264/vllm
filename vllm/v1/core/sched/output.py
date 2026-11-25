@@ -304,6 +304,11 @@ class SchedulerOutput:
     # Number of spec tokens to schedule for the next step.
     num_spec_tokens_to_schedule: int = 0
 
+    # Fixed diagnostic wire field. Identity is assigned by the scheduler, never
+    # reconstructed from worker-local counters or request ordering. Last, so a
+    # positional construction keeps the original field order.
+    pd_execution_id: str | None = None
+
     @classmethod
     def make_empty(cls) -> "SchedulerOutput":
         return cls(

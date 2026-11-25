@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from collections.abc import Callable
+import atexit
+import contextlib
+import threading
+from collections.abc import Callable, Iterator
+from functools import wraps
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 import torch
@@ -21,6 +25,7 @@ from vllm.v1.attention.backends.utils import (
     record_kv_cache_layout,
 )
 from vllm.v1.kv_cache_interface import KVCacheSpec
+from vllm.v1.metrics import pd_diagnostics as diag
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -34,6 +39,271 @@ else:
 logger = init_logger(__name__)
 
 _R = TypeVar("_R")
+
+
+# ---- A runner may take over writing this phase's worker_summary ----------------------
+_PD_CLAIMS_LOCK = threading.Lock()
+_PD_CLAIMS: dict[int, "PdFinishClaim"] = {}
+_PD_HELD: dict[int, "PdFinishClaim"] = {}
+
+
+class PdFinishClaim:
+    """Holds one worker_summary record open past the wrapped method's return, until release()."""
+
+    def __init__(self, batch: "diag.Batch"):
+        self._batch = batch
+        self._lock = threading.Lock()
+        self._result: tuple[str, str | None] | None = None  # (status, error_type) once the method returned
+        self._released = False
+        self._written = False
+
+    def set_stage_fields(self, stage: str, **fields: Any) -> bool:
+        """Add fields to stages[stage] of the held record; False when the stage is absent or it was written."""
+        batch = self._batch
+        with batch._lock:
+            if batch.closed or stage not in batch.stages:
+                return False
+            batch.stages[stage].update(fields)
+            return True
+
+    def release(self) -> None:
+        """Idempotent, any thread. Before the wrapped method returned: written at its return, as without a claim.
+        After: written now, with the status the wrapper determined."""
+        with self._lock:
+            if self._released or self._written:
+                return
+            self._released = True
+            result = self._result
+        if result is not None:
+            self._write(result)
+
+    def _returned(self, status: str, error_type: str | None) -> None:
+        with self._lock:
+            if self._written:
+                return
+            self._result = (status, error_type)
+            write_now = self._released
+        if write_now:
+            self._write((status, error_type))
+        else:
+            with _PD_CLAIMS_LOCK:
+                _PD_HELD[id(self)] = self
+
+    def _write(self, result: tuple[str, str | None]) -> None:
+        with self._lock:
+            if self._written:
+                return
+            self._written = True
+        with _PD_CLAIMS_LOCK:
+            _PD_HELD.pop(id(self), None)
+        self._batch.finish(status=result[0], error_type=result[1])
+
+
+def pd_claim_finish() -> PdFinishClaim | None:
+    """Inside a method wrapped by pd_execution or pd_sample (same thread): keep this phase's worker_summary open after
+    the method returns, until the returned claim is released. None when no worker_summary record is open here.
+    Calling it again for the same record returns the same claim. If the method raises, the record is written at once
+    with the error status, as without a claim."""
+    batch = diag.current_batch()
+    if batch is None or batch.event != "worker_summary":
+        return None
+    with _PD_CLAIMS_LOCK:
+        claim = _PD_CLAIMS.get(id(batch))
+        if claim is None:
+            claim = _PD_CLAIMS[id(batch)] = PdFinishClaim(batch)
+        return claim
+
+
+def pd_release_claims() -> None:
+    """Write every claimed record that is still held (process exit)."""
+    with _PD_CLAIMS_LOCK:
+        held = list(_PD_HELD.values())
+    for claim in held:
+        claim.release()
+
+
+atexit.register(pd_release_claims)
+
+
+@contextlib.contextmanager
+def _pd_worker_batch(phase: str, context: dict[str, Any]) -> Iterator["diag.Batch"]:
+    """diag.batch("worker_summary", phase=...) that honours pd_claim_finish(); same record, same statuses."""
+    value = diag.Batch("worker_summary", phase=phase, **context)
+    status = "ok"
+    error_type = None
+    try:
+        with diag.collect(value):
+            yield value
+    except BaseException as exc:
+        status = (
+            "cancelled"
+            if isinstance(exc, (KeyboardInterrupt, GeneratorExit))
+            or type(exc).__name__ == "CancelledError"
+            else "error"
+        )
+        error_type = type(exc).__name__
+        raise
+    finally:
+        with _PD_CLAIMS_LOCK:
+            claim = _PD_CLAIMS.pop(id(value), None)
+        if claim is None or status != "ok":
+            if claim is not None:
+                with claim._lock:
+                    claim._written = True
+            value.finish(status=status, error_type=error_type)
+        else:
+            claim._returned(status, error_type)
+
+
+def pd_execution_context(owner: Any, scheduler_output: Any) -> dict[str, Any]:
+    """Snapshot CPU identity, never retain a mutable scheduler/batch object."""
+    from vllm.distributed import get_pp_group, get_tp_group
+
+    return {
+        "execution_id": scheduler_output.pd_execution_id,
+        "request_id": None,
+        "request_ids": list(scheduler_output.num_scheduled_tokens),
+        "tp_rank": get_tp_group().rank_in_group,
+        "pp_rank": get_pp_group().rank_in_group,
+        "dp_rank": owner.parallel_config.data_parallel_index,
+        "runner": type(owner).__module__ + "." + type(owner).__qualname__,
+        "timing_domain": "host_monotonic",
+    }
+
+
+def pd_execution(method):
+    """Retain explicit execution identity across the execute/sample split."""
+
+    @wraps(method)
+    def wrapped(self, scheduler_output, *args, **kwargs):
+        dummy_run = kwargs.get("dummy_run", args[1] if len(args) > 1 else False)
+        if dummy_run:
+            with diag.scope(dummy_run=True):
+                return method(self, scheduler_output, *args, **kwargs)
+        # An Ascend override can enter the shared method on the same call.
+        if getattr(self, "_pd_executing", False):
+            return method(self, scheduler_output, *args, **kwargs)
+        context = pd_execution_context(self, scheduler_output)
+        self._pd_execution_context = context
+        self._pd_executing = True
+        try:
+            with (
+                diag.scope(**context),
+                _pd_worker_batch("execute", context),
+            ):
+                return method(self, scheduler_output, *args, **kwargs)
+        except BaseException:
+            self._pd_execution_context = None
+            raise
+        finally:
+            self._pd_executing = False
+
+    return wrapped
+
+
+def pd_sample(method):
+    """Restore the originating execute identity, including deferred MTP work."""
+
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        if getattr(self, "_pd_sampling", False):
+            return method(self, *args, **kwargs)
+        context = getattr(self, "_pd_execution_context", None)
+        self._pd_sampling = True
+        try:
+            with (
+                diag.scope(**(context or {})),
+                _pd_worker_batch("sample", context or {}),
+            ):
+                return method(self, *args, **kwargs)
+        finally:
+            self._pd_sampling = False
+            self._pd_execution_context = None
+
+    return wrapped
+
+
+_PD_STARTUP_RUNNER_LOGGED = False
+_PD_STARTUP_TIMING_LOGGED = False
+
+
+def _pd_startup_tp_rank() -> str:
+    try:
+        from vllm.distributed import get_tp_group
+
+        rank = get_tp_group().rank_in_group
+        return str(rank) if isinstance(rank, int) else "?"
+    except Exception:
+        return "?"
+
+
+def _pd_startup_log_runner(worker: Any) -> None:
+    """Plain startup log line, not a [PD_DIAG] record: the model runner class built by
+    init_device. Once per process; never raises."""
+    global _PD_STARTUP_RUNNER_LOGGED
+    try:
+        if _PD_STARTUP_RUNNER_LOGGED:
+            return
+        _PD_STARTUP_RUNNER_LOGGED = True
+        runner = getattr(worker, "model_runner", None)
+        name = (
+            f"{type(runner).__module__}.{type(runner).__qualname__}"
+            if runner is not None
+            else "?"
+        )
+        logger.info(
+            "PD_DIAG_STARTUP worker model_runner=%s tp_rank=%s",
+            name,
+            _pd_startup_tp_rank(),
+        )
+    except Exception:
+        pass
+
+
+def _pd_startup_runner_stages(timing: Any) -> tuple[str, str] | None:
+    """vllm-ascend's DeviceTiming.runner_stages (the stages it times, in order) and
+    stages_source ("default" or "env"). vllm-ascend leaves runner_stages empty when this
+    instance is not D; on D it lists at least forward and sampling, also with the four
+    runner stages off. None when empty or not readable: the line then stays unchanged."""
+    try:
+        stages = getattr(timing, "runner_stages", None)
+        if not isinstance(stages, (tuple, list)) or not stages:
+            return None
+        source = getattr(timing, "stages_source", None)
+        return ",".join(str(stage) for stage in stages), (
+            source if source in ("default", "env") else "?"
+        )
+    except Exception:
+        return None
+
+
+def _pd_startup_log_timing(worker: Any, context: Any, scheduler_output: Any) -> None:
+    """Plain log line, not a [PD_DIAG] record, after the first execute_model of a real request
+    returned: whether vllm-ascend's device timing is on ("?" if not readable). vllm-ascend
+    decides it in that step; a step that ran no forward and left it undecided does not count.
+    Once per process; never raises."""
+    global _PD_STARTUP_TIMING_LOGGED
+    try:
+        if _PD_STARTUP_TIMING_LOGGED:
+            return
+        timing = getattr(getattr(worker, "model_runner", None), "_pd_device_timing", None)
+        if timing is None and not getattr(scheduler_output, "total_num_scheduled_tokens", 0):
+            return
+        _PD_STARTUP_TIMING_LOGGED = True
+        enabled = getattr(timing, "enabled", None)
+        tp_rank = context.get("tp_rank") if isinstance(context, dict) else None
+        line = "PD_DIAG_STARTUP worker device_timing=%s tp_rank=%s"
+        args: list[Any] = [
+            "on" if enabled is True else "off" if enabled is False else "?",
+            tp_rank if isinstance(tp_rank, int) else "?",
+        ]
+        stages = _pd_startup_runner_stages(timing)
+        if stages is not None:
+            line += " runner_stages=%s source=%s"
+            args += stages
+        logger.info(line, *args)
+    except Exception:
+        pass
 
 
 class CompilationTimes(NamedTuple):
@@ -353,6 +623,9 @@ class WorkerWrapperBase:
         with set_current_vllm_config(self.vllm_config):
             # To make vLLM config available during device initialization
             self.worker.init_device()  # type: ignore
+        _pd_startup_log_runner(self.worker)
+        diag.log_diag_level(logger, "worker")
+        diag.decide_kv_load_submit(self.vllm_config)
 
     def __getattr__(self, attr: str):
         return getattr(self.worker, attr)
@@ -370,9 +643,27 @@ class WorkerWrapperBase:
     def execute_model(
         self, scheduler_output: SchedulerOutput
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        self._apply_mm_cache(scheduler_output)
+        context = pd_execution_context(self.worker, scheduler_output)
+        self._pd_worker_context = context
+        try:
+            with diag.scope(**context):
+                self._apply_mm_cache(scheduler_output)
+                output = self.worker.execute_model(scheduler_output)
+        except BaseException:
+            self._pd_worker_context = None
+            raise
+        _pd_startup_log_timing(self.worker, context, scheduler_output)
+        return output
 
-        return self.worker.execute_model(scheduler_output)
+    def sample_tokens(
+        self, grammar_output: GrammarOutput, *args: Any, **kwargs: Any
+    ) -> ModelRunnerOutput | AsyncModelRunnerOutput:
+        context = getattr(self, "_pd_worker_context", None)
+        try:
+            with diag.scope(**(context or {})):
+                return self.worker.sample_tokens(grammar_output, *args, **kwargs)
+        finally:
+            self._pd_worker_context = None
 
     def reset_mm_cache(self) -> None:
         mm_receiver_cache = self.mm_receiver_cache

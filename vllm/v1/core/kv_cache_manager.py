@@ -2,8 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import itertools
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import wraps
 from typing import Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
@@ -25,10 +27,58 @@ from vllm.v1.kv_cache_interface import (
     get_kv_cache_spec_kind,
     get_kv_cache_spec_sliding_window,
 )
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request, RequestStatus
 
 logger = init_logger(__name__)
+
+
+def _pd_range(stage: str):
+    """Keep actual manager call ranges separate from scheduler residual time."""
+
+    def decorate(method):
+        @wraps(method)
+        def observed(self, *args, **kwargs):
+            outer = self._pd_range_depth == 0
+            self._pd_range_depth += 1
+            start_ns = time.monotonic_ns()
+            status = "ok"
+            error_type = None
+            try:
+                result = method(self, *args, **kwargs)
+                if stage == "alloc" and result is None:
+                    status = "unavailable"
+                return result
+            except BaseException as exc:
+                status = (
+                    "cancelled"
+                    if isinstance(exc, (KeyboardInterrupt, GeneratorExit))
+                    or type(exc).__name__ == "CancelledError"
+                    else "error"
+                )
+                error_type = type(exc).__name__
+                raise
+            finally:
+                end_ns = time.monotonic_ns()
+                self._pd_range_depth -= 1
+                if outer:
+                    self.pd_stage_ns[stage] = (
+                        self.pd_stage_ns.get(stage, 0) + end_ns - start_ns
+                    )
+                    batch = diag.current_batch()
+                    if batch is not None and stage in ("lookup", "alloc"):
+                        batch.add_stage(
+                            stage,
+                            start_ns=start_ns,
+                            end_ns=end_ns,
+                            status=status,
+                            error_type=error_type,
+                        )
+
+        return observed
+
+    return decorate
 
 
 @dataclass
@@ -204,6 +254,8 @@ class KVCacheManager:
             if manager.retains_longer_hit
         )
         self.kv_cache_config = kv_cache_config
+        self._pd_range_depth = 0
+        self.pd_stage_ns: dict[str, int] = {}
 
         # Watermark: minimum number of KV cache blocks to keep free when
         # admitting waiting/preempted requests, to avoid frequent preemptions.
@@ -262,6 +314,7 @@ class KVCacheManager:
             preempted=request.num_preemptions > 0,
         )
 
+    @_pd_range("lookup")
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
@@ -320,6 +373,7 @@ class KVCacheManager:
         blocks = self.create_kv_cache_blocks(computed_blocks)
         return blocks, num_new_computed_tokens, shared_prefix_boundary
 
+    @_pd_range("lookup")
     def get_computed_blocks_for_connector(
         self, request: Request
     ) -> tuple[KVCacheBlocks, int, int, bool]:
@@ -367,6 +421,7 @@ class KVCacheManager:
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
         return blocks, num_local, 0, min(per_group_hits) < num_local
 
+    @_pd_range("alloc")
     def allocate_slots(
         self,
         request: Request,
@@ -600,6 +655,7 @@ class KVCacheManager:
 
         return self.create_kv_cache_blocks(new_blocks)
 
+    @_pd_range("free")
     def free(self, request: Request) -> None:
         """Free the blocks allocated for the request.
         We free the blocks in reverse order so that the tail blocks are evicted
@@ -610,6 +666,7 @@ class KVCacheManager:
         """
         self.coordinator.free(request.request_id)
 
+    @_pd_range("remove_skipped")
     def remove_skipped_blocks(
         self,
         request_id: str,
@@ -629,6 +686,7 @@ class KVCacheManager:
             request_id, processed_computed_tokens, num_prompt_tokens
         )
 
+    @_pd_range("detach_for_deferred_free")
     def pop_blocks_for_free(self, request: Request) -> list[KVCacheBlock]:
         """Pop the request's bookkeeping and return its blocks without
         returning them to the block pool. The caller must eventually free

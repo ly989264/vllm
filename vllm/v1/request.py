@@ -20,6 +20,7 @@ from vllm.v1.engine import (
     EngineCoreRequest,
     FinishReason,
 )
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.metrics.stats import PrefillStats, RequestSpecDecodeMetrics
 from vllm.v1.structured_output.request import StructuredOutputRequest
 from vllm.v1.utils import ConstantList
@@ -78,6 +79,7 @@ class Request:
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         abort_immediately: bool = False,
+        pd_identity: dict[str, Any] | None = None,
     ) -> None:
         self.request_id = request_id
         self.client_index = client_index
@@ -216,6 +218,33 @@ class Request:
         # add_request, then observed each verify step); stays None otherwise.
         self.spec_decode_metrics: RequestSpecDecodeMetrics | None = None
 
+        # Independent diagnostic counters; native retained events are unchanged.
+        self.pd_hash_duration_ns = 0
+        self.pd_hash_calls = 0
+        self.pd_hash_blocks = 0
+        self.pd_hash_ranges: list[dict[str, Any]] = []
+        self.pd_hash_ranges_dropped = 0
+        self.pd_hash_start_ns: int | None = None
+        self.pd_hash_end_ns: int | None = None
+        self.pd_hash_errors = 0
+        self.pd_hash_cancelled = 0
+        self.pd_queue_ranges: list[dict[str, Any]] = []
+        self.pd_queue_ranges_dropped = 0
+        self.pd_queue_start_ns: int | None = None
+        self.pd_queue_end_ns: int | None = None
+        self.pd_terminal_emitted = False
+        self.pd_identity: dict[str, Any] = dict(pd_identity or {})
+        self.pd_wait_start_ns: int | None = None
+        self.pd_wait_episode = 0
+        self.pd_wait_total_ns = 0
+        self.pd_initial_wait_ns: int | None = None
+        self.pd_queue_valid = True
+        self.pd_executions = 0
+        self.pd_decode_steps = 0
+        self.pd_execution_id: str | None = None
+        # D only (the scheduler calls pd_kv_ready_transition when is_pd_decode).
+        self.pd_kv_ready: dict[str, Any] | None = None
+
         self.block_hashes: list[BlockHash] = []
         # Store the block hasher without binding self to avoid creating a
         # reference cycle (Request -> partial -> Request) that prevents
@@ -260,6 +289,7 @@ class Request:
             reasoning_ended=request.reasoning_ended,
             reasoning_parser_kwargs=request.reasoning_parser_kwargs,
             abort_immediately=request.abort_immediately,
+            pd_identity=request.pd_identity,
         )
 
     def append_output_token_ids(
@@ -278,7 +308,51 @@ class Request:
     def update_block_hashes(self) -> None:
         """Compute block hashes for any new full blocks and append them."""
         if self._block_hasher is not None:
-            self.block_hashes.extend(self._block_hasher(self))
+            start_ns = time.monotonic_ns()
+            previous_blocks = len(self.block_hashes)
+            error_type = None
+            status = "ok"
+            try:
+                self.block_hashes.extend(self._block_hasher(self))
+            except BaseException as exc:
+                error_type = type(exc).__name__
+                status = (
+                    "cancelled"
+                    if isinstance(exc, (KeyboardInterrupt, GeneratorExit))
+                    or type(exc).__name__ == "CancelledError"
+                    else "error"
+                )
+                raise
+            finally:
+                end_ns = time.monotonic_ns()
+                self.pd_hash_duration_ns += end_ns - start_ns
+                if self.pd_hash_start_ns is None:
+                    self.pd_hash_start_ns = start_ns
+                self.pd_hash_end_ns = end_ns
+                self.pd_hash_errors += error_type is not None
+                self.pd_hash_cancelled += status == "cancelled"
+                if len(self.pd_hash_ranges) < 64:
+                    self.pd_hash_ranges.append(
+                        {
+                            "execution_id": (
+                                diag.current().get("execution_id")
+                                if self.request_id
+                                in diag.current().get("request_ids", ())
+                                else None
+                            ),
+                            "start_ns": start_ns,
+                            "end_ns": end_ns,
+                            "duration_ns": end_ns - start_ns,
+                            "status": status,
+                            "error_type": error_type,
+                        }
+                    )
+                else:
+                    self.pd_hash_ranges_dropped += 1
+                self.pd_hash_calls += 1
+                self.pd_hash_blocks += len(self.block_hashes) - previous_blocks
+                if error_type is not None:
+                    self.pd_queue_transition("finished", completion=status)
 
     @property
     def use_structured_output(self) -> bool:
@@ -326,6 +400,292 @@ class Request:
     def get_num_encoder_embeds(self, input_id: int) -> int:
         assert input_id < len(self.mm_features)
         return self.mm_features[input_id].mm_position.get_num_embeds()
+
+    def pd_kv_ready_transition(
+        self,
+        event: str,
+        *,
+        now_ns: int | None = None,
+        execution_id: str | None = None,
+        load_failed: bool = False,
+        waiting_for_kv: bool = False,
+    ) -> None:
+        """Rounds from the scheduler seeing this request's KV ready to the
+        schedule() call that runs it (D only; the scheduler gates every call).
+
+        ready      KV ready seen while WAITING_FOR_REMOTE_KVS: close a round
+                   still open as missing, open a new one.
+        promoted   back to WAITING/PREEMPTED: promoted_ns of the open round.
+        scheduled  run by a schedule() call: end at that call's start_ns.
+        load_failed  the pending load failed (before or after ready).
+        error / cancelled / missing  finished by finish_requests: close the
+                   open round with this status; without one, a request still
+                   WAITING_FOR_REMOTE_KVS gets a round with no start.
+        The terminal record closes a round still open as missing (cancelled on
+        shutdown) and writes stages.kv_ready_wait when there was a round.
+        """
+        if self.pd_terminal_emitted:
+            return
+        state = self.pd_kv_ready
+        if state is None:
+            state = self.pd_kv_ready = dict(
+                episode=0, ranges=[], dropped=0, first=None, open=None, failed=False
+            )
+        current = state["open"]
+        if event == "load_failed":
+            if current is not None:
+                current["load_failed"] = True
+            else:
+                state["failed"] = True
+            return
+        if event == "promoted":
+            if current is not None:
+                if current["promoted_ns"] is None:
+                    current["promoted_ns"] = time.monotonic_ns()
+                current["load_failed"] = current["load_failed"] or load_failed
+            return
+        if event == "scheduled":
+            if current is not None:
+                self._pd_kv_ready_close(current, now_ns, "ok", execution_id)
+                state["open"] = None
+            return
+        if event in ("error", "cancelled", "missing"):
+            if current is not None:
+                self._pd_kv_ready_close(current, None, event, None)
+                state["open"] = None
+            elif waiting_for_kv:
+                self._pd_kv_ready_open(state, None, load_failed)
+                self._pd_kv_ready_close(state["open"], None, event, None)
+                state["open"] = None
+            return
+        if event != "ready":
+            return
+        if current is not None:
+            self._pd_kv_ready_close(current, None, "missing", None)
+        self._pd_kv_ready_open(state, time.monotonic_ns(), load_failed)
+
+    def _pd_kv_ready_open(
+        self, state: dict[str, Any], start_ns: int | None, load_failed: bool
+    ) -> None:
+        state["episode"] += 1
+        current = dict(
+            episode=state["episode"],
+            start_ns=start_ns,
+            promoted_ns=None,
+            end_ns=None,
+            duration_ns=None,
+            ready_execution_id=(
+                diag.current().get("execution_id") if start_ns is not None else None
+            ),
+            scheduled_execution_id=None,
+            status=None,
+            load_failed=bool(load_failed or state["failed"]),
+        )
+        state["failed"] = False
+        state["open"] = current
+        if state["first"] is None:
+            state["first"] = current
+        if len(state["ranges"]) < 64:
+            state["ranges"].append(current)
+        else:
+            state["dropped"] += 1
+
+    @staticmethod
+    def _pd_kv_ready_close(
+        current: dict[str, Any],
+        end_ns: int | None,
+        status: str,
+        execution_id: str | None,
+    ) -> None:
+        start_ns = current["start_ns"]
+        current["end_ns"] = end_ns
+        current["scheduled_execution_id"] = execution_id
+        if start_ns is not None and end_ns is not None:
+            duration = end_ns - start_ns
+            valid = duration >= 0
+            current["duration_ns"] = duration if valid else None
+            current["status"] = status if valid else "invalid"
+        else:
+            current["status"] = status
+
+    def pd_queue_transition(
+        self,
+        transition: str,
+        *,
+        completion: str | None = None,
+    ) -> None:
+        """Measure initial enqueue to first candidate, excluding retry waits."""
+        if self.pd_terminal_emitted:
+            return
+        if transition == "queued":
+            if self.pd_queue_start_ns is None:
+                self.pd_queue_start_ns = time.monotonic_ns()
+                self.pd_wait_start_ns = self.pd_queue_start_ns
+            return
+        if transition == "candidate":
+            start = self.pd_wait_start_ns
+            if start is None:
+                return
+            now = time.monotonic_ns()
+            duration = now - start
+            self.pd_queue_valid = duration >= 0
+            self.pd_wait_episode = 1
+            if self.pd_queue_valid:
+                self.pd_wait_total_ns = duration
+                self.pd_initial_wait_ns = duration
+            self.pd_queue_ranges.append(
+                dict(
+                    execution_id=diag.current().get("execution_id"),
+                    episode=1,
+                    start_ns=start,
+                    end_ns=now,
+                    duration_ns=duration if self.pd_queue_valid else None,
+                    status="ok" if self.pd_queue_valid else "invalid",
+                    transition=transition,
+                )
+            )
+            self.pd_queue_end_ns = now
+            self.pd_wait_start_ns = None
+            return
+        if transition != "finished":
+            return
+        self.pd_terminal_emitted = True
+        summary = diag.Batch(
+            "core_summary",
+            scope="request",
+            request_id=self.request_id,
+            execution_id=None,
+            batch_shared=False,
+            **{
+                "observation_id": None,
+                "external_req_id": None,
+                "parent_request_id": None,
+                "api_request_id": None,
+                "prompt_index": None,
+                "choice_index": None,
+                "submission_id": None,
+                "engine_id": None,
+                "dp_rank": None,
+                "kv_role": None,
+                **self.pd_identity,
+            },
+        )
+        summary.update(
+            request_ids=[self.request_id],
+            members=[
+                dict(
+                    request_id=self.request_id,
+                    status=self.status.name,
+                    observation_id=self.pd_identity.get("observation_id"),
+                    engine_id=self.pd_identity.get("engine_id"),
+                    executions=self.pd_executions,
+                    preemptions=self.num_preemptions,
+                    decode_steps=self.pd_decode_steps,
+                )
+            ],
+            last_execution_id=self.pd_execution_id,
+            timing_scope="associated_request_lifetime",
+        )
+        summary.add_stage(
+            "queue",
+            calls=self.pd_wait_episode,
+            duration_ns=(
+                self.pd_wait_total_ns
+                if self.pd_queue_valid and self.pd_wait_episode
+                else None
+            ),
+            start_ns=self.pd_queue_start_ns,
+            end_ns=self.pd_queue_end_ns,
+            status=(
+                "invalid"
+                if not self.pd_queue_valid
+                else "ok"
+                if self.pd_wait_episode
+                else "missing"
+                if self.pd_queue_start_ns is not None
+                else "skipped"
+            ),
+            initial_wait_ns=self.pd_initial_wait_ns,
+            ranges=self.pd_queue_ranges,
+            dropped_ranges=self.pd_queue_ranges_dropped,
+            complete=self.pd_queue_valid and self.pd_wait_episode == 1,
+            timing_scope="enqueue_to_first_candidate",
+            end_observed=self.pd_wait_episode == 1,
+        )
+        summary.add_stage(
+            "hash",
+            calls=self.pd_hash_calls,
+            duration_ns=self.pd_hash_duration_ns if self.pd_hash_calls else None,
+            start_ns=self.pd_hash_start_ns,
+            end_ns=self.pd_hash_end_ns,
+            status=(
+                "cancelled"
+                if self.pd_hash_cancelled
+                else "error"
+                if self.pd_hash_errors
+                else "ok"
+                if self.pd_hash_calls
+                else "skipped"
+            ),
+            exceptions=self.pd_hash_errors,
+            failed_calls=self.pd_hash_errors,
+            blocks=self.pd_hash_blocks,
+            ranges=self.pd_hash_ranges,
+            dropped_ranges=self.pd_hash_ranges_dropped,
+            complete=not self.pd_hash_ranges_dropped,
+            timing_scope="associated_request_block_hasher_calls",
+        )
+        kv_ready = self.pd_kv_ready
+        if kv_ready is not None and kv_ready["episode"]:
+            if kv_ready["open"] is not None:
+                self._pd_kv_ready_close(
+                    kv_ready["open"],
+                    None,
+                    "cancelled" if completion == "shutdown" else "missing",
+                    None,
+                )
+                kv_ready["open"] = None
+            first = kv_ready["first"]
+            summary.add_stage(
+                "kv_ready_wait",
+                calls=kv_ready["episode"],
+                duration_ns=first["duration_ns"],
+                start_ns=first["start_ns"],
+                end_ns=first["end_ns"],
+                status=first["status"],
+                ranges=kv_ready["ranges"],
+                dropped_ranges=kv_ready["dropped"],
+                complete=first["start_ns"] is not None and first["end_ns"] is not None,
+                end_observed=first["end_ns"] is not None,
+                timing_scope="kv_ready_seen_to_scheduled",
+            )
+            # add_stage reports a call without a duration as missing; error and
+            # cancelled rounds have no end, so keep the first round's own status.
+            stage = summary.stages.get("kv_ready_wait")
+            if stage is not None:
+                stage["status"] = first["status"]
+        terminal = self.is_finished()
+        summary.finish(
+            status=(
+                "cancelled"
+                if self.pd_hash_cancelled
+                else "error"
+                if self.pd_hash_errors or self.status == RequestStatus.FINISHED_ERROR
+                else "cancelled"
+                if not terminal or self.status == RequestStatus.FINISHED_ABORTED
+                else "ok"
+            ),
+            complete=(
+                terminal
+                and self.pd_queue_valid
+                and (
+                    self.pd_queue_start_ns is None or self.pd_wait_episode == 1
+                )
+                and not self.pd_hash_ranges_dropped
+            ),
+            completion=completion or self.status.name,
+            **diag.diag_level_fields(),
+        )
 
     def record_event(
         self,

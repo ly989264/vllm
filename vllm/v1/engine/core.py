@@ -4,6 +4,7 @@ import gc
 import os
 import queue
 import signal
+import sys
 import threading
 import time
 from collections import defaultdict, deque
@@ -86,6 +87,7 @@ from vllm.v1.fault_tolerance.engine_core_sentinel import (
     fault_tolerant_wrapper,
 )
 from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.metrics.stats import SchedulerIterationDetails, SchedulerStats
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
@@ -95,6 +97,50 @@ from vllm.v1.utils import compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
+
+_PD_STARTUP_LOGGED = False
+
+
+def _pd_startup_value(config, *path: str) -> str:
+    try:
+        value = config
+        for name in path:
+            value = getattr(value, name)
+        return repr(value) if isinstance(value, bool) else "?"
+    except Exception:
+        return "?"
+
+
+def _pd_startup_log_scheduler(scheduler: object) -> None:
+    """One plain log line per process, not a [PD_DIAG] record: the scheduler class actually
+    built, and vllm-ascend's scheduler switches if vllm-ascend is already loaded ("?" if not
+    readable). Never raises."""
+    global _PD_STARTUP_LOGGED
+    try:
+        if _PD_STARTUP_LOGGED:
+            return
+        _PD_STARTUP_LOGGED = True
+        cls = type(scheduler)
+        config = None
+        try:
+            ascend_config = sys.modules.get("vllm_ascend.ascend_config")
+            if ascend_config is not None:
+                config = ascend_config.get_ascend_config().scheduler_config
+        except Exception:
+            config = None
+        logger.info(
+            "PD_DIAG_STARTUP scheduler=%s.%s balance=%s recompute=%s dyntra_lb=%s "
+            "batch_job=%s profiling_chunk=%s",
+            cls.__module__,
+            cls.__qualname__,
+            _pd_startup_value(config, "enable_balance_scheduling"),
+            _pd_startup_value(config, "recompute_scheduler_enable"),
+            _pd_startup_value(config, "dyntra_lb_config", "enabled"),
+            _pd_startup_value(config, "batch_job_sched_config", "enabled"),
+            _pd_startup_value(config, "profiling_chunk_config", "enabled"),
+        )
+    except Exception:
+        pass
 
 
 HANDSHAKE_TIMEOUT_MINS = 5
@@ -168,6 +214,8 @@ class EngineCore:
             block_size=scheduler_block_size,
             hash_block_size=hash_block_size,
         )
+        _pd_startup_log_scheduler(self.scheduler)
+        diag.log_diag_level(logger, "engine_core")
         self.use_spec_decode = vllm_config.speculative_config is not None
         self.check_for_draft_tokens = (
             self.use_spec_decode or vllm_config.model_config.is_diffusion
@@ -209,7 +257,15 @@ class EngineCore:
         # to eliminate pipeline bubbles.
         self.batch_queue_size = vllm_config.max_concurrent_batches
         self.batch_queue: (
-            deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
+            deque[
+                tuple[
+                    Future[ModelRunnerOutput],
+                    SchedulerOutput,
+                    Future[Any],
+                    diag.Batch,
+                ]
+            ]
+            | None
         ) = None
         if self.batch_queue_size > 1:
             logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
@@ -581,42 +637,149 @@ class EngineCore:
         else:
             eco.scheduler_stats.iteration_details = iteration_details
 
+    @staticmethod
+    def _pd_attach_output_identity(
+        outputs: dict[int, EngineCoreOutputs], scheduler_output: SchedulerOutput
+    ) -> None:
+        # The popped scheduler output owns async results, even when a newer
+        # execution has already been submitted on the same core thread.
+        for batch in outputs.values():
+            if batch.outputs or batch.finished_requests:
+                if batch.output_batch_id is None:
+                    batch.output_batch_id = diag.new_id("output-batch")
+                for output in batch.outputs:
+                    output.pd_execution_id = (
+                        scheduler_output.pd_execution_id
+                        if output.request_id in scheduler_output.num_scheduled_tokens
+                        else None
+                    )
+                    output.output_batch_id = batch.output_batch_id
+
     def _should_throttle_prefills(self) -> bool:
         """Whether to defer new prefills this step (DP prefill balancing).
         Overridden by the DP engine core; never throttles otherwise."""
         return False
 
+    def _pd_schedule(self) -> tuple[SchedulerOutput, diag.Batch]:
+        summary = diag.Batch(
+            "core_summary",
+            scope="execution",
+            request_id=None,
+            observation_id=None,
+            external_req_id=None,
+            parent_request_id=None,
+            api_request_id=None,
+            prompt_index=None,
+            batch_shared=True,
+        )
+        try:
+            with diag.collect(summary):
+                output = self.scheduler.schedule(self._should_throttle_prefills())
+            if output.pd_execution_id is None:
+                output.pd_execution_id = diag.new_id("execution")
+            summary.update(
+                execution_id=output.pd_execution_id,
+                request_ids=list(output.num_scheduled_tokens),
+                engine_id=getattr(self.scheduler, "_pd_engine_id", None),
+                dp_rank=self.vllm_config.parallel_config.data_parallel_index,
+                no_forward=output.total_num_scheduled_tokens == 0,
+            )
+            return output, summary
+        except BaseException as exc:
+            summary.finish(
+                status=(
+                    "cancelled"
+                    if isinstance(exc, (KeyboardInterrupt, GeneratorExit))
+                    or type(exc).__name__ == "CancelledError"
+                    else "error"
+                ),
+                error_type=type(exc).__name__,
+                complete=False,
+            )
+            raise
+
+    @contextmanager
+    def _pd_execution_scope(
+        self,
+        output: SchedulerOutput,
+        summary: diag.Batch,
+    ):
+        """Restore ownership from the actual queued execution object."""
+        transfer = self.vllm_config.kv_transfer_config
+        with (
+            diag.collect(summary),
+            diag.scope(
+                request_id=None,
+                observation_id=None,
+                external_req_id=None,
+                parent_request_id=None,
+                api_request_id=None,
+                prompt_index=None,
+                batch_shared=True,
+                execution_id=output.pd_execution_id,
+                request_ids=list(output.num_scheduled_tokens),
+                engine_id=getattr(self.scheduler, "_pd_engine_id", None),
+                dp_rank=self.vllm_config.parallel_config.data_parallel_index,
+                kv_role=transfer.kv_role if transfer is not None else None,
+                no_forward=output.total_num_scheduled_tokens == 0,
+            ),
+        ):
+            yield
+
     def step(self) -> tuple[dict[int, EngineCoreOutputs], bool]:
-        """Schedule, execute, and make output.
-
-        Returns tuple of outputs and a flag indicating whether the model
-        was executed.
-        """
-
-        # Check for any requests remaining in the scheduler - unfinished,
-        # or finished and not yet removed from the batch.
+        """Schedule, execute, and make output."""
         if not self.scheduler.has_requests():
             return {}, False
-        scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-        future = self.model_executor.execute_model(scheduler_output, non_block=True)
-        grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
-        with (
-            self.capture_iteration_details(scheduler_output) as iteration_details,
-            self.log_error_detail(scheduler_output),
+        scheduler_output, summary = self._pd_schedule()
+        try:
+            with self._pd_execution_scope(scheduler_output, summary):
+                future = self.model_executor.execute_model(
+                    scheduler_output, non_block=True
+                )
+                grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
+                with (
+                    self.capture_iteration_details(
+                        scheduler_output
+                    ) as iteration_details,
+                    self.log_error_detail(scheduler_output),
+                ):
+                    model_output = future.result()
+                    if model_output is None:
+                        model_output = self.model_executor.sample_tokens(grammar_output)
+
+                # Process aborts received during the original model execution.
+                self._process_aborts_queue()
+                engine_core_outputs = self.scheduler.update_from_output(
+                    scheduler_output, model_output
+                )
+                self._pd_attach_output_identity(engine_core_outputs, scheduler_output)
+                self._attach_iteration_details(engine_core_outputs, iteration_details)
+            summary.finish()
+            return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+        except BaseException as exc:
+            summary.finish(
+                status=(
+                    "cancelled"
+                    if isinstance(exc, (KeyboardInterrupt, GeneratorExit))
+                    or type(exc).__name__ == "CancelledError"
+                    else "error"
+                ),
+                error_type=type(exc).__name__,
+                complete=False,
+            )
+            raise
+
+    def _enqueue_output(self, client_index: int, outputs: EngineCoreOutputs) -> None:
+        if (
+            client_index != -1
+            and outputs.utility_output is None
+            and (outputs.outputs or outputs.finished_requests)
+            and outputs.output_batch_id is None
         ):
-            model_output = future.result()
-            if model_output is None:
-                model_output = self.model_executor.sample_tokens(grammar_output)
-
-        # Before processing the model output, process any aborts that happened
-        # during the model execution.
-        self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
-        self._attach_iteration_details(engine_core_outputs, iteration_details)
-
-        return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0
+            outputs.output_batch_id = diag.new_id("output-batch")
+        for output in outputs.outputs:
+            output.output_batch_id = outputs.output_batch_id
+        self.output_queue.put_nowait((client_index, outputs))
 
     def post_step(self, model_executed: bool) -> None:
         # When using async scheduling we can't get draft token ids in advance,
@@ -630,118 +793,112 @@ class EngineCore:
     def step_with_batch_queue(
         self,
     ) -> tuple[dict[int, EngineCoreOutputs] | None, bool]:
-        """Schedule and execute batches with the batch queue.
-        Note that if nothing to output in this step, None is returned.
-
-        The execution flow is as follows:
-        1. Try to schedule a new batch if the batch queue is not full.
-        If a new batch is scheduled, directly return an empty engine core
-        output. In other words, fulfilling the batch queue has a higher priority
-        than getting model outputs.
-        2. If there is no new scheduled batch, meaning that the batch queue
-        is full or no other requests can be scheduled, we block until the first
-        batch in the job queue is finished.
-        3. Update the scheduler from the output.
-        """
-
+        """Schedule asynchronously, completing each summary with its own output."""
         batch_queue = self.batch_queue
         assert batch_queue is not None
-
-        # Try to schedule a new batch if the batch queue is not full, but
-        # the scheduler may return an empty batch if all requests are scheduled.
-        # Note that this is not blocking.
         assert len(batch_queue) < self.batch_queue_size
-
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
-            scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
-            with self.log_error_detail(scheduler_output):
-                exec_future = self.model_executor.execute_model(
-                    scheduler_output, non_block=True
-                )
-            if self.is_ec_consumer:
-                model_executed = scheduler_output.total_num_scheduled_tokens > 0
+        submitted_summary = None
+        completed_summary = None
+        try:
+            if self.scheduler.has_requests():
+                scheduler_output, submitted_summary = self._pd_schedule()
+                with self._pd_execution_scope(scheduler_output, submitted_summary):
+                    with self.log_error_detail(scheduler_output):
+                        exec_future = self.model_executor.execute_model(
+                            scheduler_output, non_block=True
+                        )
+                    if self.is_ec_consumer:
+                        model_executed = scheduler_output.total_num_scheduled_tokens > 0
 
-            if self.is_pooling_model or not model_executed:
-                # No sampling required (no requests scheduled).
-                future = cast(Future[ModelRunnerOutput], exec_future)
-            else:
-                if not scheduler_output.pending_structured_output_tokens:
-                    # We aren't waiting for any tokens, get any grammar output
-                    # and sample immediately.
-                    grammar_output = self.scheduler.get_grammar_bitmask(
+                    if self.is_pooling_model or not model_executed:
+                        future = cast(Future[ModelRunnerOutput], exec_future)
+                    elif not scheduler_output.pending_structured_output_tokens:
+                        grammar_output = self.scheduler.get_grammar_bitmask(
+                            scheduler_output
+                        )
+                        future = self.model_executor.sample_tokens(
+                            grammar_output, non_block=True
+                        )
+                    else:
+                        deferred_scheduler_output = scheduler_output
+
+                if deferred_scheduler_output is None:
+                    batch_queue.appendleft(
+                        (future, scheduler_output, exec_future, submitted_summary)
+                    )
+                    if len(batch_queue) < self.batch_queue_size and (
+                        model_executed or self.scheduler.has_requests()
+                    ):
+                        return None, model_executed
+            elif not batch_queue:
+                return None, False
+
+            future, scheduler_output, exec_model_fut, completed_summary = (
+                batch_queue.pop()
+            )
+            with self._pd_execution_scope(scheduler_output, completed_summary):
+                with (
+                    self.capture_iteration_details(
                         scheduler_output
+                    ) as iteration_details,
+                    self.log_error_detail(scheduler_output),
+                ):
+                    model_output = future.result()
+                    if model_output is None:
+                        # Preserve the original execute failure, not a sample symptom.
+                        exec_model_fut.result()
+                        raise RuntimeError("unexpected error")
+
+                self._process_aborts_queue()
+                engine_core_outputs = self.scheduler.update_from_output(
+                    scheduler_output, model_output
+                )
+                self._pd_attach_output_identity(engine_core_outputs, scheduler_output)
+                self._attach_iteration_details(engine_core_outputs, iteration_details)
+            completed_summary.finish()
+
+            if deferred_scheduler_output is not None:
+                assert submitted_summary is not None
+                with self._pd_execution_scope(
+                    deferred_scheduler_output, submitted_summary
+                ):
+                    if self.check_for_draft_tokens:
+                        draft_token_ids = self.model_executor.take_draft_token_ids()
+                        if draft_token_ids is not None:
+                            self.scheduler.update_draft_token_ids_in_output(
+                                draft_token_ids, deferred_scheduler_output
+                            )
+                    grammar_output = self.scheduler.get_grammar_bitmask(
+                        deferred_scheduler_output
                     )
                     future = self.model_executor.sample_tokens(
                         grammar_output, non_block=True
                     )
-                else:
-                    # We need to defer sampling until we have processed the model output
-                    # from the prior step.
-                    deferred_scheduler_output = scheduler_output
-
-            if not deferred_scheduler_output:
-                # Add this step's future to the queue.
-                batch_queue.appendleft((future, scheduler_output, exec_future))
-                if len(batch_queue) < self.batch_queue_size and (
-                    model_executed or self.scheduler.has_requests()
-                ):
-                    # Don't block on next worker response unless the queue is full
-                    # or there are no more requests to schedule.
-                    return None, model_executed
-
-        elif not batch_queue:
-            # Queue is empty. We should not reach here since this method should
-            # only be called when the scheduler contains requests or the queue
-            # is non-empty.
-            return None, False
-
-        # Block until the next result is available.
-        future, scheduler_output, exec_model_fut = batch_queue.pop()
-        with (
-            self.capture_iteration_details(scheduler_output) as iteration_details,
-            self.log_error_detail(scheduler_output),
-        ):
-            model_output = future.result()
-            if model_output is None:
-                # None from sample_tokens() implies that the original execute_model()
-                # call failed - raise that exception.
-                exec_model_fut.result()
-                raise RuntimeError("unexpected error")
-
-        # Before processing the model output, process any aborts that happened
-        # during the model execution.
-        self._process_aborts_queue()
-        engine_core_outputs = self.scheduler.update_from_output(
-            scheduler_output, model_output
-        )
-        self._attach_iteration_details(engine_core_outputs, iteration_details)
-
-        # NOTE(nick): We can either handle the deferred tasks here or save
-        # in a field and do it immediately once step_with_batch_queue is
-        # re-called. The latter slightly favors TTFT over TPOT/throughput.
-        if deferred_scheduler_output:
-            # When draft tokens are used with structured output, validate them
-            # before computing the grammar bitmask for the deferred request.
-            if self.check_for_draft_tokens:
-                draft_token_ids = self.model_executor.take_draft_token_ids()
-                if draft_token_ids is not None:
-                    # Update the draft token ids in the scheduler output to
-                    # filter out the invalid spec tokens, which will be padded
-                    # with -1 and skipped by the grammar bitmask computation.
-                    self.scheduler.update_draft_token_ids_in_output(
-                        draft_token_ids, deferred_scheduler_output
-                    )
-            # We now have the tokens needed to compute the bitmask for the
-            # deferred request. Get the bitmask and call sample tokens.
-            grammar_output = self.scheduler.get_grammar_bitmask(
-                deferred_scheduler_output
+                batch_queue.appendleft(
+                    (future, deferred_scheduler_output, exec_future, submitted_summary)
+                )
+            return engine_core_outputs, model_executed
+        except BaseException as exc:
+            fields = dict(
+                status=(
+                    "cancelled"
+                    if isinstance(exc, (KeyboardInterrupt, GeneratorExit))
+                    or type(exc).__name__ == "CancelledError"
+                    else "error"
+                ),
+                error_type=type(exc).__name__,
+                complete=False,
             )
-            future = self.model_executor.sample_tokens(grammar_output, non_block=True)
-            batch_queue.appendleft((future, deferred_scheduler_output, exec_future))
-
-        return engine_core_outputs, model_executed
+            if submitted_summary is not None:
+                submitted_summary.finish(**fields)
+            if completed_summary is not None:
+                completed_summary.finish(**fields)
+            for item in batch_queue:
+                if len(item) > 3:
+                    item[3].finish(**fields)
+            raise
 
     def _process_aborts_queue(self):
         if not self.aborts_queue.empty():
@@ -755,6 +912,9 @@ class EngineCore:
 
     def shutdown(self):
         logger.debug_once("[shutdown] EngineCore: tearing down local resources")
+        for item in self.batch_queue or ():
+            if len(item) > 3:
+                item[3].finish(status="cancelled", completion="shutdown", complete=False)
         self.structured_output_manager.clear_backend()
         if self.model_executor:
             self.model_executor.shutdown()
@@ -1463,8 +1623,8 @@ class EngineCoreProc(EngineCore):
         # Step the engine core.
         outputs, model_executed = self.step_fn()
         # Put EngineCoreOutputs into the output queue.
-        for output in outputs.items() if outputs else ():
-            self.output_queue.put_nowait(output)
+        for client_index, output in outputs.items() if outputs else ():
+            self._enqueue_output(client_index, output)
         # Post-step hook.
         self.post_step(model_executed)
 
@@ -1871,22 +2031,20 @@ class EngineCoreProc(EngineCore):
             request.request_id,
             err.mm_hashes,
         )
-        self.output_queue.put_nowait(
-            (
-                request.client_index,
-                EngineCoreOutputs(
-                    engine_index=self.engine_index,
-                    finished_requests={request.request_id},
-                    outputs=[
-                        EngineCoreOutput(
-                            request_id=request.request_id,
-                            new_token_ids=[],
-                            finish_reason=FinishReason.ERROR,
-                            mm_cache_miss_hashes=err.mm_hashes,
-                        )
-                    ],
-                ),
-            )
+        self._enqueue_output(
+            request.client_index,
+            EngineCoreOutputs(
+                engine_index=self.engine_index,
+                finished_requests={request.request_id},
+                outputs=[
+                    EngineCoreOutput(
+                        request_id=request.request_id,
+                        new_token_ids=[],
+                        finish_reason=FinishReason.ERROR,
+                        mm_cache_miss_hashes=err.mm_hashes,
+                    )
+                ],
+            ),
         )
 
     @staticmethod
@@ -1970,7 +2128,7 @@ class EngineCoreProc(EngineCore):
             for req_id in req_ids
         ]
         eco = EngineCoreOutputs(finished_requests=req_ids, outputs=outputs)
-        self.output_queue.put_nowait((client_index, eco))
+        self._enqueue_output(client_index, eco)
 
     def _send_abort_outputs_to_client(
         self, req_ids: list[str], client_index: int

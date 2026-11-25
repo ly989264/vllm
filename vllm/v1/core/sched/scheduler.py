@@ -60,6 +60,7 @@ from vllm.v1.kv_cache_interface import (
     get_mamba_prefill_checkpoint_position,
     is_mamba_prefill_checkpoint_valid,
 )
+from vllm.v1.metrics import pd_diagnostics as diag
 from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import (
     PrefixCacheStats,
@@ -77,6 +78,10 @@ logger = init_logger(__name__)
 
 
 class Scheduler(SchedulerInterface):
+    # Set in __init__; the class values cover schedulers built without it.
+    _pd_decode = False
+    _pd_kv_ready_open: "list[Request] | tuple[()]" = ()
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -89,6 +94,7 @@ class Scheduler(SchedulerInterface):
         log_stats: bool = False,
     ) -> None:
         self.vllm_config = vllm_config
+        self._pd_engine_id = diag.new_id("engine")
         self.scheduler_config = vllm_config.scheduler_config
         self.cache_config = vllm_config.cache_config
         self.lora_config = vllm_config.lora_config
@@ -410,6 +416,11 @@ class Scheduler(SchedulerInterface):
         # async KV loads). Their remaining-block reservation gates async loads.
         self._inflight_prefills: set[Request] = set()
 
+        # D only: kv_ready_wait rounds (stages.kv_ready_wait of core_summary[request]).
+        # Decided once, after the KV connector and vllm-ascend's config are set up.
+        self._pd_decode = diag.is_pd_decode(vllm_config)
+        self._pd_kv_ready_open = []
+
     def _mamba_block_aligned_split(
         self,
         request: Request,
@@ -559,6 +570,85 @@ class Scheduler(SchedulerInterface):
         return max(num_new_tokens, 0)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        execution_id = diag.new_id("execution")
+        transfer = self.vllm_config.kv_transfer_config
+        summary = diag.current_batch()
+        owned = summary is None
+        if owned:
+            summary = diag.Batch("core_summary", scope="execution")
+        identity = dict(
+            request_id=None,
+            observation_id=None,
+            external_req_id=None,
+            parent_request_id=None,
+            api_request_id=None,
+            prompt_index=None,
+            execution_id=execution_id,
+            request_ids=[],
+            engine_id=self._pd_engine_id,
+            batch_shared=True,
+            dp_rank=self.parallel_config.data_parallel_index,
+            kv_role=transfer.kv_role if transfer is not None else None,
+            role="unknown",
+        )
+        summary.update(**identity)
+        self.kv_cache_manager.pd_stage_ns.clear()
+        self._pd_external_lookup_ns = 0
+        self._pd_external_lookup_calls = 0
+        start_ns = time.monotonic_ns()
+        status = "ok"
+        error_type = None
+        with diag.scope(**identity), diag.collect(summary):
+            try:
+                output = self._schedule(throttle_prefills)
+                if self._pd_kv_ready_open:
+                    self._pd_kv_ready_scheduled(output, start_ns, execution_id)
+                summary.update(
+                    request_ids=list(output.num_scheduled_tokens),
+                    num_scheduled_tokens=dict(output.num_scheduled_tokens),
+                    total_num_scheduled_tokens=output.total_num_scheduled_tokens,
+                    no_forward=output.total_num_scheduled_tokens == 0,
+                )
+                return output
+            except BaseException as exc:
+                status = (
+                    "cancelled"
+                    if isinstance(exc, (KeyboardInterrupt, GeneratorExit))
+                    or type(exc).__name__ == "CancelledError"
+                    else "error"
+                )
+                error_type = type(exc).__name__
+                raise
+            finally:
+                end_ns = time.monotonic_ns()
+                elapsed = end_ns - start_ns
+                measured = sum(self.kv_cache_manager.pd_stage_ns.values())
+                summary.add_stage(
+                    "schedule",
+                    start_ns=start_ns,
+                    end_ns=end_ns,
+                    status=status,
+                    error_type=error_type,
+                )
+                summary.add_stage(
+                    "other",
+                    duration_ns=elapsed - measured - self._pd_external_lookup_ns,
+                    source=(
+                        "schedule_minus_nonoverlapping_manager_and_external_lookup_ranges"
+                    ),
+                    timing_scope="schedule_residual",
+                )
+                for stage in ("lookup", "alloc"):
+                    if stage not in self.kv_cache_manager.pd_stage_ns and (
+                        stage != "lookup" or not self._pd_external_lookup_calls
+                    ):
+                        summary.add_stage(stage, calls=0, status="skipped")
+                if owned or status != "ok":
+                    summary.finish(
+                        status=status, error_type=error_type, complete=status == "ok"
+                    )
+
+    def _schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         self.current_step += 1
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -868,6 +958,7 @@ class Scheduler(SchedulerInterface):
                 assert request_queue is not None
 
                 request = request_queue.peek_request()
+                request.pd_queue_transition("candidate")
                 request_id = request.request_id
 
                 # try to promote blocked statuses while traversing skipped queue.
@@ -933,11 +1024,35 @@ class Scheduler(SchedulerInterface):
                         block_aligned_local = (
                             num_new_local_computed_tokens - partial_tail
                         )
-                        ext_tokens, load_kv_async = (
-                            self.connector.get_num_new_matched_tokens(
-                                request, block_aligned_local
+                        lookup_start = time.monotonic_ns()
+                        lookup_status = "ok"
+                        lookup_error = None
+                        try:
+                            ext_tokens, load_kv_async = (
+                                self.connector.get_num_new_matched_tokens(
+                                    request, block_aligned_local
+                                )
                             )
-                        )
+                        except BaseException as exc:
+                            lookup_status = (
+                                "cancelled"
+                                if isinstance(exc, (KeyboardInterrupt, GeneratorExit))
+                                or type(exc).__name__ == "CancelledError"
+                                else "error"
+                            )
+                            lookup_error = type(exc).__name__
+                            raise
+                        finally:
+                            lookup_end = time.monotonic_ns()
+                            self._pd_external_lookup_ns += lookup_end - lookup_start
+                            self._pd_external_lookup_calls += 1
+                            diag.current_batch().add_stage(
+                                "lookup",
+                                start_ns=lookup_start,
+                                end_ns=lookup_end,
+                                status=lookup_status,
+                                error_type=lookup_error,
+                            )
 
                         if ext_tokens is None:
                             # The request cannot be scheduled because
@@ -1242,6 +1357,7 @@ class Scheduler(SchedulerInterface):
                 if num_external_computed_tokens > 0:
                     # load_kv_async is False here
                     has_sync_kv_loads = True
+                request.pd_execution_id = diag.current().get("execution_id")
                 if self.log_stats:
                     request.record_event(
                         EngineCoreEventType.SCHEDULED, scheduled_timestamp
@@ -1405,6 +1521,7 @@ class Scheduler(SchedulerInterface):
             )
 
         scheduler_output = SchedulerOutput(
+            pd_execution_id=diag.current().get("execution_id"),
             scheduled_new_reqs=new_reqs_data,
             scheduled_cached_reqs=cached_reqs_data,
             num_scheduled_tokens=num_scheduled_tokens,
@@ -1450,6 +1567,47 @@ class Scheduler(SchedulerInterface):
         # write KV and have their output processed later in update_from_output).
         if self.defer_block_free and total_num_scheduled_tokens > 0:
             self.sched_step_seq += 1
+
+        members = []
+        for request_id, scheduled_tokens in num_scheduled_tokens.items():
+            request = self.requests[request_id]
+            request.pd_execution_id = scheduler_output.pd_execution_id
+            request.pd_executions += 1
+            if (
+                scheduled_tokens > 0
+                and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
+                request.pd_decode_steps += 1
+            members.append(
+                {
+                    "request_id": request_id,
+                    "observation_id": request.pd_identity.get("observation_id"),
+                    "engine_id": self._pd_engine_id,
+                    "scheduled_tokens": scheduled_tokens,
+                    "num_computed_tokens_before": request.num_computed_tokens,
+                    "num_output_tokens": request.num_output_tokens,
+                    "num_prompt_tokens": request.num_prompt_tokens,
+                    "num_tokens": request.num_tokens,
+                    "is_prefill_chunk": (
+                        request.num_computed_tokens + scheduled_tokens
+                        < request.num_tokens + request.num_output_placeholders
+                    ),
+                    "prefill_tokens_remaining_before": max(
+                        request.num_prompt_tokens - request.num_computed_tokens, 0
+                    ),
+                    "num_spec_tokens": len(
+                        scheduled_spec_decode_tokens.get(request_id, ())
+                    ),
+                    "execution_participation": request.pd_executions,
+                }
+            )
+        diag.current_batch().update(
+            request_ids=list(num_scheduled_tokens),
+            members=members,
+            no_forward=total_num_scheduled_tokens == 0,
+            finished_request_ids=list(scheduler_output.finished_req_ids),
+            preempted_request_ids=[request.request_id for request in preempted_reqs],
+        )
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
@@ -1914,6 +2072,8 @@ class Scheduler(SchedulerInterface):
                     num_scheduled_tokens,
                 )
             )
+        if failed_kv_load_req_ids and self._pd_decode:
+            self._pd_kv_load_failed(failed_kv_load_req_ids)
 
         # Persist per-step routed experts into the scheduler-side slot
         # buffer (CPU->CPU fancy-index assign; ~few MB per step).
@@ -2482,9 +2642,17 @@ class Scheduler(SchedulerInterface):
                 # Streaming-input session finished.
                 self.finish_requests(request.request_id, RequestStatus.FINISHED_ABORTED)
         else:
+            transfer = self.vllm_config.kv_transfer_config
+            request.pd_identity = {
+                **request.pd_identity,
+                "engine_id": self._pd_engine_id,
+                "dp_rank": self.parallel_config.data_parallel_index,
+                "kv_role": transfer.kv_role if transfer is not None else None,
+            }
             if request.resumable:
                 request.streaming_queue = deque()
             self._enqueue_waiting_request(request)
+            request.pd_queue_transition("queued")
             self.requests[request.request_id] = request
             if self.spec_decode_metrics_level != "none":
                 request.spec_decode_metrics = RequestSpecDecodeMetrics.new(
@@ -2545,6 +2713,8 @@ class Scheduler(SchedulerInterface):
 
         # Second pass: set status and free requests
         for request in valid_requests:
+            if self._pd_decode:
+                self._pd_kv_ready_finish(request, finished_status)
             delay_free_blocks = False
             if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                 delay_free_blocks = (
@@ -2562,6 +2732,7 @@ class Scheduler(SchedulerInterface):
         self, request: Request, delay_free_blocks: bool = False
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         assert request.is_finished()
+        request.pd_queue_transition("finished")
 
         self._inflight_prefills.discard(request)
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
@@ -2816,6 +2987,10 @@ class Scheduler(SchedulerInterface):
 
     def shutdown(self) -> None:
         logger.debug_once("[shutdown] Scheduler: start")
+        for request in self.requests.values():
+            if self._pd_decode:
+                self._pd_kv_ready_finish(request, RequestStatus.FINISHED_ABORTED)
+            request.pd_queue_transition("finished", completion="shutdown")
         if self.kv_event_publisher:
             self.kv_event_publisher.shutdown()
         if self.connector is not None:
@@ -2969,6 +3144,11 @@ class Scheduler(SchedulerInterface):
             # in KVConnectorOutput.finished_recving
             if request.request_id not in self.finished_recving_kv_req_ids:
                 return False
+            if self._pd_decode:
+                request.pd_kv_ready_transition(
+                    "promoted",
+                    load_failed=request.request_id in self.failed_recving_kv_req_ids,
+                )
             self._update_waiting_for_remote_kv(request)
             if request.num_preemptions:
                 request.status = RequestStatus.PREEMPTED
@@ -3015,6 +3195,8 @@ class Scheduler(SchedulerInterface):
             assert req_id in self.requests
             req = self.requests[req_id]
             if req.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+                if self._pd_decode and req_id not in self.finished_recving_kv_req_ids:
+                    self._pd_kv_ready_seen(req)
                 self.finished_recving_kv_req_ids.add(req_id)
             else:
                 assert RequestStatus.is_finished(req.status)
@@ -3162,6 +3344,61 @@ class Scheduler(SchedulerInterface):
                 affected_req_ids.add(request.request_id)
 
         return affected_req_ids, total_affected_tokens, blocks_to_evict
+
+    def _pd_kv_ready_seen(self, request: Request) -> None:
+        """KV ready seen while WAITING_FOR_REMOTE_KVS opens a kv_ready_wait round."""
+        state = request.pd_kv_ready
+        was_open = state is not None and state["open"] is not None
+        request.pd_kv_ready_transition(
+            "ready", load_failed=request.request_id in self.failed_recving_kv_req_ids
+        )
+        if not was_open:
+            self._pd_kv_ready_open.append(request)
+
+    def _pd_kv_ready_scheduled(
+        self, output: SchedulerOutput, start_ns: int, execution_id: str
+    ) -> None:
+        """Close the rounds of requests this schedule() call runs, at its start."""
+        scheduled = output.num_scheduled_tokens
+        still_open = []
+        for request in self._pd_kv_ready_open:
+            state = request.pd_kv_ready
+            if state is None or state["open"] is None:
+                continue
+            if (
+                request.status == RequestStatus.RUNNING
+                and request.request_id in scheduled
+            ):
+                request.pd_kv_ready_transition(
+                    "scheduled", now_ns=start_ns, execution_id=execution_id
+                )
+            else:
+                still_open.append(request)
+        self._pd_kv_ready_open = still_open
+
+    def _pd_kv_load_failed(self, req_ids: Iterable[str]) -> None:
+        for req_id in req_ids:
+            request = self.requests.get(req_id)
+            if (
+                request is not None
+                and request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+            ):
+                request.pd_kv_ready_transition("load_failed")
+
+    def _pd_kv_ready_finish(
+        self, request: Request, finished_status: RequestStatus
+    ) -> None:
+        waiting = request.status == RequestStatus.WAITING_FOR_REMOTE_KVS
+        if waiting or request.pd_kv_ready is not None:
+            request.pd_kv_ready_transition(
+                "error"
+                if finished_status == RequestStatus.FINISHED_ERROR
+                else "cancelled"
+                if finished_status == RequestStatus.FINISHED_ABORTED
+                else "missing",
+                waiting_for_kv=waiting,
+                load_failed=request.request_id in self.failed_recving_kv_req_ids,
+            )
 
     def _handle_failed_recving(self, failed_req_ids: set[str]) -> set[str]:
         """Fail closed for layouts whose block IDs are not globally unique."""
